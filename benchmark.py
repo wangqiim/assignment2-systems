@@ -2,7 +2,40 @@ import timeit
 import cs336_basics
 import torch
 from torch.utils.data import Dataset, DataLoader
-import pandas
+from einops import rearrange, einsum
+import einx
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+from jaxtyping import Float, Bool, Int
+import math
+import torch.cuda.nvtx as nvtx
+
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+
+    with nvtx.range("computing attention scores"):
+        d_k = K.shape[-1]
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    
+    with nvtx.range("computing softmax"):
+        attention_weights = cs336_basics.model.softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    with nvtx.range("final matmul"):
+        proj = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    return proj 
+
+# cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
 
 class RandomVocabDataset(Dataset):
     def __init__(self, dataset_len, context_length, vocab_size):
@@ -19,7 +52,7 @@ class RandomVocabDataset(Dataset):
     def __len__(self):
       return self.dataset_len - self.context_length - 1
 
-def benchmark_model(model, dataloader: DataLoader, device, num_warmup=5, num_repeats=10):
+def benchmark_model(model, dataloader: DataLoader, device, num_warmup=15, num_repeats=10):
   data_iter = iter(dataloader)
   # Warmup
   for _ in range(num_warmup):
@@ -31,6 +64,8 @@ def benchmark_model(model, dataloader: DataLoader, device, num_warmup=5, num_rep
     loss.backward()
   torch.cuda.synchronize()
   
+  
+  model.eval()
   # Benchmark
   # 1. only forward
   start_time = timeit.default_timer()
@@ -38,19 +73,24 @@ def benchmark_model(model, dataloader: DataLoader, device, num_warmup=5, num_rep
     inputs, targets = next(data_iter)
     inputs = inputs.to(device)
     targets = inputs.to(device)
-    logistics = model(inputs)
+    with nvtx.range("Forward"):
+      logistics = model(inputs)
   torch.cuda.synchronize()
   avg_forward_time = (timeit.default_timer() - start_time) / num_repeats
   
+  model.train()
   # 2. forward + backward
   start_time = timeit.default_timer()
   for _ in range(num_repeats):
+    model.zero_grad()
     inputs, targets = next(data_iter)
     inputs = inputs.to(device)
     targets = inputs.to(device)
-    logistics = model(inputs)
+    with nvtx.range("Forward"):
+      logistics = model(inputs)
     loss = cs336_basics.cross_entropy(logistics, targets)
-    loss.backward()
+    with nvtx.range("Backward"):
+      loss.backward()
   torch.cuda.synchronize()
   avg_forward_backward_time = (timeit.default_timer() - start_time) / num_repeats
   
@@ -97,7 +137,7 @@ def main():
     # 要测试的模型配置列表
     model_configs = [
       {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12},
-      {"d_model": 1024, "d_ff": 3072, "num_layers": 12, "num_heads": 16},
+      # {"d_model": 1024, "d_ff": 3072, "num_layers": 12, "num_heads": 16},
       # {"d_model": 1024, "d_ff": 4096, "num_layers": 24, "num_heads": 16},
       # {"d_model": 1280, "d_ff": 5120, "num_layers": 36, "num_heads": 20},
       # {"d_model": 1600, "d_ff": 6400, "num_layers": 48, "num_heads": 25},
