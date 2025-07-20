@@ -20,21 +20,25 @@ def annotated_scaled_dot_product_attention(
     mask: Bool[Tensor, " ... queries keys"] | None = None,
 ) -> Float[Tensor, " ... queries d_v"]:
 
+    torch.cuda.synchronize()
     with nvtx.range("computing attention scores"):
         d_k = K.shape[-1]
         attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
-        if mask is not None:
-            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    torch.cuda.synchronize()
+    if mask is not None:
+        attention_scores = torch.where(mask, attention_scores, float("-inf"))
     
+    torch.cuda.synchronize()
     with nvtx.range("computing softmax"):
         attention_weights = cs336_basics.model.softmax(attention_scores, dim=-1)  # Softmax over the key dimension
-
+    torch.cuda.synchronize()
+    
     with nvtx.range("final matmul"):
         proj = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
     return proj 
 
-# cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 
 class RandomVocabDataset(Dataset):
@@ -52,16 +56,17 @@ class RandomVocabDataset(Dataset):
     def __len__(self):
       return self.dataset_len - self.context_length - 1
 
-def benchmark_model(model, dataloader: DataLoader, device, num_warmup=15, num_repeats=10):
+def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup=5, num_repeats=10):
   data_iter = iter(dataloader)
   # Warmup
   for _ in range(num_warmup):
-    inputs, targets = next(data_iter)
-    inputs = inputs.to(device)
-    targets = inputs.to(device)
-    logistics = model(inputs)
-    loss = cs336_basics.cross_entropy(logistics, targets)
-    loss.backward()
+    with nvtx.range("WarUp"):
+      inputs, targets = next(data_iter)
+      inputs = inputs.to(device)
+      targets = inputs.to(device)
+      logistics = model(inputs)
+      loss = cs336_basics.cross_entropy(logistics, targets)
+      loss.backward()
   torch.cuda.synchronize()
   
   
@@ -73,25 +78,26 @@ def benchmark_model(model, dataloader: DataLoader, device, num_warmup=15, num_re
     inputs, targets = next(data_iter)
     inputs = inputs.to(device)
     targets = inputs.to(device)
+    torch.cuda.synchronize()
     with nvtx.range("Forward"):
       logistics = model(inputs)
-  torch.cuda.synchronize()
+      torch.cuda.synchronize()
   avg_forward_time = (timeit.default_timer() - start_time) / num_repeats
   
   model.train()
-  # 2. forward + backward
+  # 2. forward + optimizer
   start_time = timeit.default_timer()
   for _ in range(num_repeats):
-    model.zero_grad()
-    inputs, targets = next(data_iter)
-    inputs = inputs.to(device)
-    targets = inputs.to(device)
-    with nvtx.range("Forward"):
+    with nvtx.range("Optimizer"):
+      optimizer.zero_grad()
+      inputs, targets = next(data_iter)
+      inputs = inputs.to(device)
+      targets = inputs.to(device)
       logistics = model(inputs)
-    loss = cs336_basics.cross_entropy(logistics, targets)
-    with nvtx.range("Backward"):
+      loss = cs336_basics.cross_entropy(logistics, targets)
       loss.backward()
-  torch.cuda.synchronize()
+      optimizer.step()
+      torch.cuda.synchronize()
   avg_forward_backward_time = (timeit.default_timer() - start_time) / num_repeats
   
   return avg_forward_time, avg_forward_backward_time
@@ -109,6 +115,7 @@ class BenchmarkJob:
   def __call__(self):
     device = torch.device("cuda")
     # 初始化模型和数据
+    
     net = cs336_basics.BasicsTransformerLM(
       vocab_size=self.vocab_size,
       context_length=self.context_length,
@@ -117,12 +124,14 @@ class BenchmarkJob:
       num_heads=self.model_config["num_heads"],
       d_ff=self.model_config["d_ff"],
       rope_theta=self.rope_theta).to(device)
+    params = [p for p in net.parameters() if p.requires_grad]
+    optimizer = cs336_basics.AdamW(params, lr=0.01, betas = (0.9, 0.999), eps=1e-8, weight_decay=0.01)
     
     dataset = RandomVocabDataset(dataset_len=self.context_length*100, context_length=self.context_length, vocab_size=self.vocab_size)
     dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
     
     # 运行 benchmark
-    avg_forward_time, avg_forward_backward_time = benchmark_model(net, dataloader, device)
+    avg_forward_time, avg_forward_backward_time = benchmark_model(net, dataloader, optimizer=optimizer, device=device)
     
     # 返回结果
     return {
