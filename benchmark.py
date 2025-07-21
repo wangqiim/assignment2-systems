@@ -3,8 +3,9 @@ import cs336_basics
 import torch
 from torch.utils.data import Dataset, DataLoader
 from einops import rearrange, einsum
+from contextlib import nullcontext
 import einx
-
+import argparse
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -56,7 +57,7 @@ class RandomVocabDataset(Dataset):
     def __len__(self):
       return self.dataset_len - self.context_length - 1
 
-def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup=5, num_repeats=10):
+def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup=5, num_repeats=10, mixed_precision=False):
   data_iter = iter(dataloader)
   # Warmup
   for _ in range(num_warmup):
@@ -80,8 +81,9 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
     targets = inputs.to(device)
     torch.cuda.synchronize()
     with nvtx.range("Forward"):
-      logistics = model(inputs)
-      torch.cuda.synchronize()
+      with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=mixed_precision):
+        logistics = model(inputs)
+        torch.cuda.synchronize()
   avg_forward_time = (timeit.default_timer() - start_time) / num_repeats
   
   model.train()
@@ -93,11 +95,12 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
       inputs, targets = next(data_iter)
       inputs = inputs.to(device)
       targets = inputs.to(device)
-      logistics = model(inputs)
-      loss = cs336_basics.cross_entropy(logistics, targets)
-      loss.backward()
-      optimizer.step()
-      torch.cuda.synchronize()
+      with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=mixed_precision):
+        logistics = model(inputs)
+        loss = cs336_basics.cross_entropy(logistics, targets)
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize()
   avg_forward_backward_time = (timeit.default_timer() - start_time) / num_repeats
   
   return avg_forward_time, avg_forward_backward_time
@@ -105,12 +108,13 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
 
 # 4. 定义 Submitit 作业
 class BenchmarkJob:
-  def __init__(self, model_config):
+  def __init__(self, model_config, mixed_precision: bool):
     self.model_config = model_config
     self.batch_size=4
     self.context_length = 256
     self.rope_theta = 1000
     self.vocab_size = 10000
+    self.mixed_precision = mixed_precision
     
   def __call__(self):
     device = torch.device("cuda")
@@ -131,7 +135,7 @@ class BenchmarkJob:
     dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
     
     # 运行 benchmark
-    avg_forward_time, avg_forward_backward_time = benchmark_model(net, dataloader, optimizer=optimizer, device=device)
+    avg_forward_time, avg_forward_backward_time = benchmark_model(net, dataloader, optimizer=optimizer, device=device, mixed_precision=self.mixed_precision)
     
     # 返回结果
     return {
@@ -143,6 +147,10 @@ class BenchmarkJob:
     }
 
 def main():
+    parser = argparse.ArgumentParser(description='benchmark 测试')
+    parser.add_argument('--mixed_precision', action='store_true', help='启用混合精度模式')
+    args = parser.parse_args()
+    
     # 要测试的模型配置列表
     model_configs = [
       {"d_model": 768, "d_ff": 3072, "num_layers": 12, "num_heads": 12},
@@ -156,7 +164,7 @@ def main():
     # 提交作业
     results = []
     for config in model_configs:
-      results.append(BenchmarkJob(config)())
+      results.append(BenchmarkJob(config, args.mixed_precision)())
     
     # 打印结果
     for result in results:
