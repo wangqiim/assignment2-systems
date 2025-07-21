@@ -57,7 +57,7 @@ class RandomVocabDataset(Dataset):
     def __len__(self):
       return self.dataset_len - self.context_length - 1
 
-def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup=5, num_repeats=10, mixed_precision=False):
+def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup=5, num_repeats=10, mixed_precision=False, record_memory=False):
   data_iter = iter(dataloader)
   # Warmup
   for _ in range(num_warmup):
@@ -74,6 +74,8 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
   model.eval()
   # Benchmark
   # 1. only forward
+  if (record_memory):
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
   start_time = timeit.default_timer()
   for _ in range(num_repeats):
     inputs, targets = next(data_iter)
@@ -85,9 +87,14 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
         logistics = model(inputs)
         torch.cuda.synchronize()
   avg_forward_time = (timeit.default_timer() - start_time) / num_repeats
-  
+  if (record_memory):
+    torch.cuda.memory._dump_snapshot("forward_memory_snapshot.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
+    
   model.train()
   # 2. forward + optimizer
+  if (record_memory):
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
   start_time = timeit.default_timer()
   for _ in range(num_repeats):
     with nvtx.range("Optimizer"):
@@ -102,19 +109,23 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
         optimizer.step()
         torch.cuda.synchronize()
   avg_forward_backward_time = (timeit.default_timer() - start_time) / num_repeats
+  if (record_memory):
+    torch.cuda.memory._dump_snapshot("forward_backward_memory_snapshot.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
   
   return avg_forward_time, avg_forward_backward_time
 
 
 # 4. 定义 Submitit 作业
 class BenchmarkJob:
-  def __init__(self, model_config, mixed_precision: bool):
+  def __init__(self, model_config, mixed_precision: bool, record_memory: bool):
     self.model_config = model_config
     self.batch_size=4
     self.context_length = 256
     self.rope_theta = 1000
     self.vocab_size = 10000
     self.mixed_precision = mixed_precision
+    self.record_memory = record_memory
     
   def __call__(self):
     device = torch.device("cuda")
@@ -135,7 +146,7 @@ class BenchmarkJob:
     dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
     
     # 运行 benchmark
-    avg_forward_time, avg_forward_backward_time = benchmark_model(net, dataloader, optimizer=optimizer, device=device, mixed_precision=self.mixed_precision)
+    avg_forward_time, avg_forward_backward_time = benchmark_model(net, dataloader, optimizer=optimizer, device=device, mixed_precision=self.mixed_precision, record_memory=self.record_memory)
     
     # 返回结果
     return {
@@ -149,6 +160,7 @@ class BenchmarkJob:
 def main():
     parser = argparse.ArgumentParser(description='benchmark 测试')
     parser.add_argument('--mixed_precision', action='store_true', help='启用混合精度模式')
+    parser.add_argument('--record_memory', action='store_true', help='记录显存使用情况') # https://docs.pytorch.org/memory_viz
     args = parser.parse_args()
     
     # 要测试的模型配置列表
@@ -164,7 +176,7 @@ def main():
     # 提交作业
     results = []
     for config in model_configs:
-      results.append(BenchmarkJob(config, args.mixed_precision)())
+      results.append(BenchmarkJob(config, args.mixed_precision, args.record_memory)())
     
     # 打印结果
     for result in results:
