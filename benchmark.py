@@ -118,7 +118,7 @@ def benchmark_model(model, dataloader: DataLoader, optimizer, device, num_warmup
 
 # 4. 定义 Submitit 作业
 class BenchmarkJob:
-  def __init__(self, model_config, mixed_precision: bool, record_memory: bool):
+  def __init__(self, model_config, mixed_precision: bool, record_memory: bool, jit: bool):
     self.model_config = model_config
     self.batch_size=4
     self.context_length = 256
@@ -126,6 +126,7 @@ class BenchmarkJob:
     self.vocab_size = 10000
     self.mixed_precision = mixed_precision
     self.record_memory = record_memory
+    self.jit = jit
     
   def __call__(self):
     device = torch.device("cuda")
@@ -139,6 +140,8 @@ class BenchmarkJob:
       num_heads=self.model_config["num_heads"],
       d_ff=self.model_config["d_ff"],
       rope_theta=self.rope_theta).to(device)
+    if self.jit:
+      net = torch.compile(net)
     params = [p for p in net.parameters() if p.requires_grad]
     optimizer = cs336_basics.AdamW(params, lr=0.01, betas = (0.9, 0.999), eps=1e-8, weight_decay=0.01)
     
@@ -161,6 +164,7 @@ def main():
     parser = argparse.ArgumentParser(description='benchmark 测试')
     parser.add_argument('--mixed_precision', action='store_true', help='启用混合精度模式')
     parser.add_argument('--record_memory', action='store_true', help='记录显存使用情况') # https://docs.pytorch.org/memory_viz
+    parser.add_argument('--jit', action='store_true', help='开启jit') # https://docs.pytorch.org/memory_viz
     args = parser.parse_args()
     
     # 要测试的模型配置列表
@@ -176,7 +180,7 @@ def main():
     # 提交作业
     results = []
     for config in model_configs:
-      results.append(BenchmarkJob(config, args.mixed_precision, args.record_memory)())
+      results.append(BenchmarkJob(config, args.mixed_precision, args.record_memory, args.jit)())
     
     # 打印结果
     for result in results:
